@@ -112,6 +112,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	if errBuild != nil {
 		return resp, errBuild
 	}
+	body = helps.EnsureCodexInstallationID(body, req.Payload, auth)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	payloadOpts := opts
@@ -215,6 +216,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	if errBuild != nil {
 		return nil, errBuild
 	}
+	body = helps.EnsureCodexInstallationID(body, req.Payload, auth)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	payloadOpts := opts
@@ -343,6 +345,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
 	defer reporter.TrackFailure(ctx, &err)
+	body = helps.EnsureCodexInstallationID(body, req.Payload, auth)
 	reporter.SetTranslatedReasoningEffort(body, "openai")
 
 	url := strings.TrimSuffix(baseURL, "/") + endpointPath
@@ -410,6 +413,7 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
 	defer reporter.TrackFailure(ctx, &err)
+	body = helps.EnsureCodexInstallationID(body, req.Payload, auth)
 	reporter.SetTranslatedReasoningEffort(body, "openai")
 
 	url := strings.TrimSuffix(baseURL, "/") + endpointPath
