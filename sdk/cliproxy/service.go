@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
@@ -1325,6 +1326,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	s.cfgMu.Lock()
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
+	toolemu.Default.Replace(newCfg.ToolEmulation.DefaultsApplied())
 	if s.coreManager != nil {
 		s.coreManager.SetConfig(newCfg)
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
@@ -1633,6 +1635,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.applyRetryConfig(s.cfg)
 	s.configureCooldownStateStore(s.cfg)
+	if s.cfg != nil {
+		toolemu.Default.Replace(s.cfg.ToolEmulation.DefaultsApplied())
+	}
 
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {

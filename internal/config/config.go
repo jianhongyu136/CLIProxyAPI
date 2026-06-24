@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -164,6 +165,10 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+
+	// ToolEmulation enables prompt-injection based tool-call emulation for
+	// upstream models that do not support native tool calling.
+	ToolEmulation toolemu.ToolEmulationConfig `yaml:"tool-emulation" json:"tool-emulation,omitempty"`
 }
 
 // PluginsConfig holds dynamic plugin system settings.
