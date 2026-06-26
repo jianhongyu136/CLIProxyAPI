@@ -23,10 +23,11 @@ type StreamEvents struct {
 type streamState int
 
 const (
-	stProse     streamState = iota
-	stMaybeOpen             // buffering potential "<tool_call>" prefix
-	stInCall                // inside tool_call block, parsing JSON
-	stSkipClose             // consuming optional </tool_call> after JSON closes
+	stProse        streamState = iota
+	stMaybeOpen                // buffering potential folded-protocol prefix
+	stInCall                   // inside tool_call block, parsing JSON
+	stSkipClose                // consuming optional </tool_call> after JSON closes
+	stInToolResult             // consuming a private tool_result history block
 )
 
 // StreamParser is an incremental state machine that parses <tool_call> blocks
@@ -117,6 +118,8 @@ func (p *StreamParser) Close() {
 				p.emitProseRune(fr)
 			}
 		}
+	case stInToolResult:
+		p.buf.Reset()
 	}
 
 	if p.events.OnComplete != nil {
@@ -159,6 +162,8 @@ func (p *StreamParser) feedRune(r rune) {
 		p.feedInCall(r)
 	case stSkipClose:
 		p.feedSkipClose(r)
+	case stInToolResult:
+		p.feedToolResult(r)
 	}
 }
 
@@ -182,6 +187,13 @@ func (p *StreamParser) feedMaybeOpen(r rune) {
 			p.state = stInCall
 			p.buf.Reset()
 			p.resetInCallState()
+		}
+		return
+	}
+	if streamMaybeToolResultOpen(bufStr) {
+		if streamToolResultOpenComplete(bufStr) {
+			p.state = stInToolResult
+			p.buf.Reset()
 		}
 		return
 	}
@@ -422,6 +434,47 @@ func (p *StreamParser) feedSkipClose(r rune) {
 	for _, fr := range flush {
 		p.feedRune(fr)
 	}
+}
+
+func (p *StreamParser) feedToolResult(r rune) {
+	p.buf.WriteRune(r)
+	bufStr := p.buf.String()
+	closeAt := caseInsensitiveIndex(bufStr, toolResultCloseTag, 0)
+	if closeAt < 0 {
+		return
+	}
+	rest := bufStr[closeAt+len(toolResultCloseTag):]
+	p.buf.Reset()
+	p.state = stProse
+	for _, rr := range rest {
+		p.feedRune(rr)
+	}
+}
+
+func streamMaybeToolResultOpen(buf string) bool {
+	if len(buf) <= len(toolResultOpenTag) {
+		return strings.EqualFold(buf, toolResultOpenTag[:len(buf)])
+	}
+	if !strings.EqualFold(buf[:len(toolResultOpenTag)], toolResultOpenTag) {
+		return false
+	}
+	next := buf[len(toolResultOpenTag)]
+	return next == '>' || isASCIISpace(next)
+}
+
+func streamToolResultOpenComplete(buf string) bool {
+	if len(buf) <= len(toolResultOpenTag) || !strings.EqualFold(buf[:len(toolResultOpenTag)], toolResultOpenTag) {
+		return false
+	}
+	for i := len(toolResultOpenTag); i < len(buf); i++ {
+		if buf[i] == '>' {
+			return true
+		}
+		if i == len(toolResultOpenTag) && !isASCIISpace(buf[i]) {
+			return false
+		}
+	}
+	return false
 }
 
 func (p *StreamParser) emitProse(s string) {

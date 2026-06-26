@@ -11,8 +11,10 @@ import (
 )
 
 const (
-	openTag  = "<tool_call>"
-	closeTag = "</tool_call>"
+	openTag            = "<tool_call>"
+	closeTag           = "</tool_call>"
+	toolResultOpenTag  = "<tool_result"
+	toolResultCloseTag = "</tool_result>"
 )
 
 // Parse extracts <tool_call>{...}</tool_call> blocks from upstream assistant
@@ -26,56 +28,85 @@ const (
 func Parse(text string) (Parsed, error) {
 	var proseParts []string
 	var calls []ParsedToolCall
-	validOpenTags := unescapedToolCallOpenOffsets(text)
+	md := newMdContext()
 	i := 0
-	offsetCursor := 0
 	for i < len(text) {
-		openAt, nextCursor := nextOpenTagOffset(validOpenTags, offsetCursor, i)
-		offsetCursor = nextCursor
+		openAt, kind := nextSentinelOffset(text, i, md)
 		if openAt < 0 {
 			proseParts = append(proseParts, text[i:])
 			break
 		}
-		bodyStart, bodyEnd, nextStart, ok := locateToolCallBlock(text, openAt)
-		if !ok {
-			return Parsed{}, fmt.Errorf("toolemu: unterminated <tool_call>")
-		}
 		proseParts = append(proseParts, text[i:openAt])
-		payload := strings.TrimSpace(text[bodyStart:bodyEnd])
-		call, err := parseOneCall(payload)
-		if err != nil {
-			// TODO: Remove or redact raw_text after the debugging window closes.
-			log.WithError(err).WithField("raw_text", text).Error("tool call parse failed")
-			return Parsed{}, err
+		switch kind {
+		case sentinelToolCall:
+			bodyStart, bodyEnd, nextStart, ok := locateToolCallBlock(text, openAt)
+			if !ok {
+				return Parsed{}, fmt.Errorf("toolemu: unterminated <tool_call>")
+			}
+			payload := strings.TrimSpace(text[bodyStart:bodyEnd])
+			call, err := parseOneCall(payload)
+			if err != nil {
+				// TODO: Remove or redact raw_text after the debugging window closes.
+				log.WithError(err).WithField("raw_text", text).Error("tool call parse failed")
+				return Parsed{}, err
+			}
+			calls = append(calls, call)
+			i = nextStart
+		case sentinelToolResult:
+			i = locateToolResultBlockEnd(text, openAt)
+		default:
+			proseParts = append(proseParts, text[openAt:])
+			i = len(text)
 		}
-		calls = append(calls, call)
-		i = nextStart
 	}
 	prose := strings.TrimRight(strings.TrimLeft(strings.Join(proseParts, ""), "\n"), "\n")
 	return Parsed{Prose: prose, ToolCalls: calls}, nil
 }
 
-func unescapedToolCallOpenOffsets(text string) []int {
-	var offsets []int
-	md := newMdContext()
-	for i, r := range text {
+type sentinelKind int
+
+const (
+	sentinelNone sentinelKind = iota
+	sentinelToolCall
+	sentinelToolResult
+)
+
+func nextSentinelOffset(text string, start int, md *mdContext) (int, sentinelKind) {
+	for i, r := range text[start:] {
+		offset := start + i
 		md.feedRune(r)
-		if r == '<' && !md.inEscapedContext() && i+len(openTag) <= len(text) && strings.EqualFold(text[i:i+len(openTag)], openTag) {
-			offsets = append(offsets, i)
+		if r != '<' || md.inEscapedContext() {
+			continue
+		}
+		if hasFoldedTagAt(text, offset, openTag) {
+			return offset, sentinelToolCall
+		}
+		if hasToolResultOpenAt(text, offset) {
+			return offset, sentinelToolResult
 		}
 	}
-	return offsets
+	return -1, sentinelNone
 }
 
-func nextOpenTagOffset(offsets []int, cursor int, start int) (int, int) {
-	for cursor < len(offsets) {
-		offset := offsets[cursor]
-		if offset >= start {
-			return offset, cursor
-		}
-		cursor++
+func hasFoldedTagAt(text string, offset int, tag string) bool {
+	return offset+len(tag) <= len(text) && strings.EqualFold(text[offset:offset+len(tag)], tag)
+}
+
+func hasToolResultOpenAt(text string, offset int) bool {
+	if !hasFoldedTagAt(text, offset, toolResultOpenTag) {
+		return false
 	}
-	return -1, cursor
+	next := offset + len(toolResultOpenTag)
+	return next < len(text) && (text[next] == '>' || isASCIISpace(text[next]))
+}
+
+func locateToolResultBlockEnd(text string, openAt int) int {
+	bodyStart := openAt + len(toolResultOpenTag)
+	closeAt := caseInsensitiveIndex(text, toolResultCloseTag, bodyStart)
+	if closeAt < 0 {
+		return len(text)
+	}
+	return closeAt + len(toolResultCloseTag)
 }
 
 // locateToolCallBlock resolves the JSON body range for a <tool_call> block

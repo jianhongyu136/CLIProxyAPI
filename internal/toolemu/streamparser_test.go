@@ -77,6 +77,21 @@ func TestStreamParser_ProseOnly(t *testing.T) {
 	}
 }
 
+func TestStreamParser_DropsToolResultSentinelFromProse(t *testing.T) {
+	spy := &spyEvents{}
+	p := NewStreamParser(spy.events(), UpstreamMeta{ResponseID: "r", Provider: "p", Model: "m"})
+	for _, fragment := range []string{"before <tool_res", "ult index=\"0\">secret", " output</tool_result> after"} {
+		p.Feed(fragment)
+	}
+	p.Close()
+	if spy.allProse() != "before  after" {
+		t.Fatalf("tool_result sentinel leaked into prose: %q", spy.allProse())
+	}
+	if len(spy.toolStarts) != 0 {
+		t.Fatalf("tool_result must not start a tool call: %+v", spy.toolStarts)
+	}
+}
+
 func TestStreamParser_SingleToolCall(t *testing.T) {
 	spy := &spyEvents{}
 	p := NewStreamParser(spy.events(), UpstreamMeta{ResponseID: "r", Provider: "p", Model: "m"})

@@ -74,6 +74,8 @@ Rules:
   stringify it (no "arguments": "{...}"), do NOT omit the field.
 - You MAY emit multiple <tool_call> blocks in one response; they will be
   executed in order.
+- Do NOT emit <tool_result> blocks. They are historical context only; never
+  quote, copy, summarize, or continue them in your response.
 - Do not invent tools that are not listed in <tools_doc>.
 
 Formats that are NOT recognized and will be treated as plain text (your tool

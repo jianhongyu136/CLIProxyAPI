@@ -67,6 +67,7 @@ func TestRenderInjection_RejectsNativeToolCallEnvelopes(t *testing.T) {
 		`do NOT prefix it ("functions."`,
 		`do NOT suffix it with an index (":0"`,
 		"Markdown-fenced JSON",
+		"Do NOT emit <tool_result>",
 	}
 	for _, needle := range mustContain {
 		if !strings.Contains(out, needle) {

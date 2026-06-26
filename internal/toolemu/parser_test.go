@@ -107,6 +107,19 @@ func TestParse_NoToolCallProsePreserved(t *testing.T) {
 	}
 }
 
+func TestParse_DropsToolResultSentinelFromProse(t *testing.T) {
+	p, err := Parse(`before <tool_result index="0">secret output</tool_result> after`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Prose != "before  after" {
+		t.Fatalf("tool_result sentinel leaked into prose: %q", p.Prose)
+	}
+	if len(p.ToolCalls) != 0 {
+		t.Fatalf("tool_result must not become a tool call: %+v", p.ToolCalls)
+	}
+}
+
 func TestParse_IgnoresToolCallInsideCodeFence(t *testing.T) {
 	text := "```\n<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>\n```\n"
 	p, err := Parse(text)
