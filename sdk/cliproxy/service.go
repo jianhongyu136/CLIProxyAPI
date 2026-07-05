@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
@@ -1545,6 +1546,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
+	toolemu.Default.Replace(cfg.ToolEmulation.DefaultsApplied())
 
 	registrationCtx := coreauth.WithSkipPersist(ctx)
 	s.syncPluginRuntimeConfigForConfig(registrationCtx, cfg)
@@ -2367,6 +2369,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.applyRetryConfig(s.cfg)
 	s.configureCooldownStateStore(s.cfg)
+	if s.cfg != nil {
+		toolemu.Default.Replace(s.cfg.ToolEmulation.DefaultsApplied())
+	}
 
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {

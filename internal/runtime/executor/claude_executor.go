@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -345,12 +346,50 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
-	}
+	signCCH := oauthToken || experimentalCCHSigningEnabled(e.cfg, auth)
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
+
+	// Tool-call emulation: when the configured (provider, model/alias) rule
+	// matches and the request carries tool artifacts, fold tools/tool_choice
+	// into the system prompt, send the folded body upstream, then parse any
+	// emitted raw tool blocks back into native Anthropic tool_use blocks.
+	// Only the non-stream path is wired here; the streaming path handles the
+	// emulation branch separately in ExecuteStream.
+	if helps.ToolEmuActive(ctx, e.Identifier(), baseModel, requestedModel, bodyForUpstream) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		send := e.buildClaudeToolEmuSend(auth, url, apiKey, extraBetas, signCCH, opts.Headers)
+		outcome, errEmu := helps.RunToolEmu(ctx, bodyForUpstream, toolemu.ShapeClaudeMessages, e.Identifier(), policy, send)
+		if errEmu != nil {
+			return resp, errEmu
+		}
+		outcome.BuiltBody = restoreClaudeOAuthToolNamesFromResponse(outcome.BuiltBody, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
+		reporter.Publish(ctx, helps.ParseClaudeUsage(outcome.BuiltBody))
+		reporter.EnsurePublished(ctx)
+		var param any
+		out := sdktranslator.TranslateNonStream(
+			ctx,
+			to,
+			responseFormat,
+			req.Model,
+			opts.OriginalRequest,
+			outcome.Folded,
+			outcome.BuiltBody,
+			&param,
+		)
+		resp = cliproxyexecutor.Response{Payload: out}
+		return resp, nil
+	}
+
+	if signCCH {
+		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return resp, err
@@ -460,6 +499,77 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	return resp, nil
 }
 
+// buildClaudeToolEmuSend returns the upstream send closure used by toolemu's
+// fold -> parse -> retry loop. It POSTs the (possibly folded) Claude messages
+// body to the Anthropic messages endpoint and returns the full non-stream JSON
+// response body. Claude's non-stream path returns a single JSON object, so this
+// is simpler than the Codex variant (no SSE event aggregation).
+func (e *ClaudeExecutor) buildClaudeToolEmuSend(auth *cliproxyauth.Auth, url, apiKey string, extraBetas []string, signCCH bool, incomingHeaders http.Header) toolemu.UpstreamSendFunc {
+	provider := e.Identifier()
+	return func(sctx context.Context, body []byte) ([]byte, error) {
+		bodyToSend := finalizeClaudeToolEmuFoldedBody(body)
+		if signCCH {
+			bodyToSend = signAnthropicMessagesBody(bodyToSend)
+		}
+		httpReq, errReq := http.NewRequestWithContext(sctx, http.MethodPost, url, bytes.NewReader(bodyToSend))
+		if errReq != nil {
+			return nil, errReq
+		}
+		if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, incomingHeaders); errHeaders != nil {
+			return nil, errHeaders
+		}
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(sctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      bodyToSend,
+			Provider:  provider,
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		client := helps.NewUtlsHTTPClient(sctx, e.cfg, auth, 0)
+		httpResp, errDo := client.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(sctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		defer func() {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("claude executor: close response body error: %v", errClose)
+			}
+		}()
+		helps.RecordAPIResponseMetadata(sctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		decodedBody, errDecode := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
+		if errDecode != nil {
+			helps.RecordAPIResponseError(sctx, e.cfg, errDecode)
+			return nil, errDecode
+		}
+		defer func() {
+			if errClose := decodedBody.Close(); errClose != nil {
+				log.Errorf("claude executor: close decoded response body error: %v", errClose)
+			}
+		}()
+		data, errRead := io.ReadAll(decodedBody)
+		if errRead != nil {
+			helps.RecordAPIResponseError(sctx, e.cfg, errRead)
+			return nil, errRead
+		}
+		helps.AppendAPIResponseChunk(sctx, e.cfg, data)
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			return nil, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		}
+		return data, nil
+	}
+}
+
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
@@ -536,12 +646,144 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
-	}
+	signCCH := oauthToken || experimentalCCHSigningEnabled(e.cfg, auth)
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
+
+	// Tool-call emulation (streaming): fold tools/tool_choice into the system
+	// prompt, send the folded body upstream as a normal streaming request, then
+	// pump the SSE text deltas through toolemu's stream parser and re-emit
+	// native Anthropic content_block frames (text + tool_use) downstream. The
+	// emitter produces bare "data:" frames so the claude→target stream
+	// translators consume them like any other Claude SSE line.
+	if helps.ToolEmuActive(ctx, e.Identifier(), baseModel, requestedModel, bodyForUpstream) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		choice := toolemu.ExtractToolChoice(bodyForUpstream, toolemu.ShapeClaudeMessages)
+		tools, errTools := toolemu.ExtractToolSpecs(bodyForUpstream, toolemu.ShapeClaudeMessages)
+		if errTools != nil {
+			return nil, errTools
+		}
+		policy.Tools = tools
+		folded, errFold := toolemu.FoldRequest(bodyForUpstream, toolemu.FoldOpts{Shape: toolemu.ShapeClaudeMessages, Provider: e.Identifier(), FenceToken: policy.FenceToken, TagGroup: policy.TagGroup})
+		if errFold != nil {
+			return nil, errFold
+		}
+		foldedForUpstream := finalizeClaudeToolEmuFoldedBody(folded)
+		if signCCH {
+			foldedForUpstream = signAnthropicMessagesBody(foldedForUpstream)
+		}
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(foldedForUpstream))
+		if errReq != nil {
+			return nil, errReq
+		}
+		if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, opts.Headers); errHeaders != nil {
+			return nil, errHeaders
+		}
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      foldedForUpstream,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient = reporter.TrackHTTPClient(httpClient)
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
+			if decErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, decErr)
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("response body close error: %v", errClose)
+				}
+				return nil, statusErr{code: httpResp.StatusCode, msg: fmt.Sprintf("failed to decode error response body: %v", decErr)}
+			}
+			b, readErr := io.ReadAll(errBody)
+			if readErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+				b = []byte(fmt.Sprintf("failed to read error response body: %v", readErr))
+			}
+			if errClose := errBody.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+			return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		}
+		decodedBody, errDecode := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
+		if errDecode != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDecode)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			return nil, errDecode
+		}
+		ctx = toolemu.MarkFolded(ctx, true)
+		out := make(chan cliproxyexecutor.StreamChunk)
+		go func() {
+			defer close(out)
+			defer func() {
+				if errClose := decodedBody.Close(); errClose != nil {
+					log.Errorf("response body close error: %v", errClose)
+				}
+			}()
+			var param any
+			meta := toolemu.UpstreamMeta{Provider: e.Identifier(), Model: baseModel}
+			upMeta, errStream := helps.RunToolEmuStream(ctx, meta, toolemu.ShapeClaudeMessages, decodedBody, choice, policy, func(frame []byte) {
+				frame = restoreClaudeOAuthToolNamesFromStreamLine(frame, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, frame)
+				chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, bodyForTranslation, bytes.Clone(frame), &param)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			})
+			if errStream != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+				reporter.PublishFailure(ctx, errStream)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errStream}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			if len(upMeta.UsagePayload) > 0 {
+				if detail := helps.ParseClaudeUsage(upMeta.UsagePayload); detail.TotalTokens > 0 {
+					reporter.Publish(ctx, detail)
+				}
+			}
+			reporter.EnsurePublished(ctx)
+		}()
+		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	}
+
+	if signCCH {
+		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return nil, err
@@ -1380,10 +1622,50 @@ func restoreClaudeOAuthToolNamesFromResponse(body []byte, prefix string, prefixD
 // restoreClaudeOAuthToolNamesFromStreamLine undoes the Claude OAuth tool-name
 // transforms for SSE lines in reverse order.
 func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, prefix string, prefixDisabled bool, reverseMap map[string]string) []byte {
-	if !prefixDisabled {
-		line = stripClaudeToolPrefixFromStreamLine(line, prefix)
+	restoreLine := func(dataLine []byte) []byte {
+		if !prefixDisabled {
+			dataLine = stripClaudeToolPrefixFromStreamLine(dataLine, prefix)
+		}
+		return reverseRemapOAuthToolNamesFromStreamLine(dataLine, reverseMap)
 	}
-	return reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
+	if bytes.Contains(line, []byte("\n")) {
+		return restoreClaudeOAuthToolNamesFromStreamFrame(line, restoreLine)
+	}
+	return restoreLine(line)
+}
+
+// restoreClaudeOAuthToolNamesFromStreamFrame applies restoreLine to each line of
+// a multi-line SSE frame (as emitted by the toolemu stream emitter, which packs
+// the event and data lines into a single frame), preserving line terminators.
+func restoreClaudeOAuthToolNamesFromStreamFrame(frame []byte, restoreLine func([]byte) []byte) []byte {
+	parts := bytes.SplitAfter(frame, []byte("\n"))
+	out := make([]byte, 0, len(frame))
+	changed := false
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		line := part
+		suffix := []byte(nil)
+		if bytes.HasSuffix(line, []byte("\n")) {
+			suffix = []byte("\n")
+			line = line[:len(line)-1]
+			if bytes.HasSuffix(line, []byte("\r")) {
+				suffix = []byte("\r\n")
+				line = line[:len(line)-1]
+			}
+		}
+		restored := restoreLine(line)
+		if !bytes.Equal(restored, line) {
+			changed = true
+		}
+		out = append(out, restored...)
+		out = append(out, suffix...)
+	}
+	if !changed {
+		return frame
+	}
+	return out
 }
 
 // remapOAuthToolNames renames third-party tool names to Claude Code equivalents
@@ -2357,6 +2639,21 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 	return payload
 }
 
+func finalizeClaudeToolEmuFoldedBody(body []byte) []byte {
+	body = enforceCacheControlLimit(body, 4)
+	body = normalizeCacheControlTTL(body)
+	return body
+}
+
+func isToolEmuInjectionCacheBlock(item gjson.Result) bool {
+	text := item.Get("text")
+	if text.Type != gjson.String {
+		return false
+	}
+	value := text.String()
+	return strings.Contains(value, "<tools_doc>") && strings.Contains(value, "<tool_protocol>")
+}
+
 // enforceCacheControlLimit removes excess cache_control blocks from a payload
 // so the total does not exceed the Anthropic API limit (currently 4).
 //
@@ -2370,9 +2667,10 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 //
 //	Phase 1: system blocks earliest-first, preserving the last one.
 //	Phase 2: tool blocks earliest-first, preserving the last one.
-//	Phase 3: message content blocks earliest-first.
+//	Phase 3: message content blocks earliest-first, preserving tool-emulation injection blocks.
 //	Phase 4: remaining system blocks (last system).
 //	Phase 5: remaining tool blocks (last tool).
+//	Phase 6: protected tool-emulation injection blocks only if unavoidable.
 func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
@@ -2384,6 +2682,41 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 	}
 
 	excess := total - maxBlocks
+	deleteMessageCacheControls := func(preserveToolEmuInjection bool) {
+		messages := gjson.GetBytes(payload, "messages")
+		if !messages.IsArray() {
+			return
+		}
+		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
+			if excess <= 0 {
+				return false
+			}
+			content := msg.Get("content")
+			if !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(itemIdx, item gjson.Result) bool {
+				if excess <= 0 {
+					return false
+				}
+				if !item.Get("cache_control").Exists() {
+					return true
+				}
+				if preserveToolEmuInjection && isToolEmuInjectionCacheBlock(item) {
+					return true
+				}
+				path := fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(itemIdx.Int()))
+				updated, errDel := sjson.DeleteBytes(payload, path)
+				if errDel != nil {
+					return true
+				}
+				payload = updated
+				excess--
+				return true
+			})
+			return true
+		})
+	}
 
 	system := gjson.GetBytes(payload, "system")
 	if system.IsArray() {
@@ -2457,35 +2790,7 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 		return payload
 	}
 
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(itemIdx.Int()))
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-			return true
-		})
-	}
+	deleteMessageCacheControls(true)
 	if excess <= 0 {
 		return payload
 	}
@@ -2532,6 +2837,11 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 			return true
 		})
 	}
+	if excess <= 0 {
+		return payload
+	}
+
+	deleteMessageCacheControls(false)
 
 	return payload
 }
