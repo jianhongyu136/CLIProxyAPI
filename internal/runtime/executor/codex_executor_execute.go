@@ -10,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -74,6 +75,31 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	if helps.ToolEmuActive(ctx, e.Identifier(), baseModel, requestedModel, body) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		send := e.buildCodexToolEmuSend(from, auth, req, originalPayloadSource, url, apiKey, baseModel, opts.Headers, replayScope, optimizeMultiAgentV2)
+		outcome, errEmu := helps.RunToolEmu(ctx, body, toolemu.ShapeOpenAIResponses, e.Identifier(), policy, send)
+		if errEmu != nil {
+			return resp, errEmu
+		}
+		wrapped := []byte(`{"type":"response.completed"}`)
+		wrapped, _ = sjson.SetRawBytes(wrapped, "response", outcome.BuiltBody)
+		wrapped = helps.RestoreCodexMultiAgentV2Response(wrapped, optimizeMultiAgentV2)
+		if detail, ok := helps.ParseCodexUsage(wrapped); ok {
+			reporter.Publish(ctx, detail)
+		}
+		cacheCodexReasoningReplayFromCompleted(replayScope, wrapped)
+		reporter.EnsurePublished(ctx)
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, outcome.Folded, wrapped, &param)
+		resp = cliproxyexecutor.Response{Payload: out}
+		return resp, nil
+	}
+
 	var identityState codexIdentityConfuseState
 	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body, opts.Headers)
 	if err != nil {
