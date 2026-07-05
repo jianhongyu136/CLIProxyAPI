@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/toolemu"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -199,6 +200,36 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, errSession
 	}
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	if helps.ToolEmuActiveDoc(ctx, e.Identifier(), baseModel, helps.PayloadRequestedModel(opts, req.Model), doc) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		var responseHeaders http.Header
+		send := e.buildCodexToolEmuSend(from, auth, req, originalPayloadSource, url, apiKey, baseModel, opts.Headers, replayScope, optimizeMultiAgentV2, reporter, &responseHeaders)
+		outcome, errEmu := helps.RunToolEmuDoc(ctx, doc, toolemu.ShapeOpenAIResponses, e.Identifier(), policy, send)
+		if errEmu != nil {
+			return resp, errEmu
+		}
+		wrappedDoc := ojson.NewDocString(`{"type":"response.completed"}`)
+		_ = wrappedDoc.SetRawBytes("response", outcome.BuiltBody)
+		wrapped := wrappedDoc.Bytes()
+		wrapped = helps.RestoreCodexMultiAgentV2Response(wrapped, optimizeMultiAgentV2)
+		if detail, ok := helps.ParseCodexUsage(wrapped); ok {
+			reporter.Publish(ctx, detail)
+		}
+		cacheCodexReasoningReplayFromCompleted(replayScope, wrapped)
+		reporter.EnsurePublished(ctx)
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, outcome.Folded, wrapped, &param)
+		if responseFormat == sdktranslator.FormatOpenAIResponse {
+			out = helps.EnsureResponsesUsageDetails(out)
+		}
+		resp = cliproxyexecutor.Response{Payload: out, Headers: responseHeaders}
+		return resp, nil
+	}
+
 	httpReq, upstreamBody, err := e.cacheHelperDoc(ctx, from, url, req, doc, auth, opts.Headers)
 	if err != nil {
 		return resp, err
