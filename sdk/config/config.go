@@ -4,11 +4,18 @@
 // embed CLIProxyAPI without importing internal packages.
 package config
 
-import internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+import (
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
+)
 
 type SDKConfig = internalconfig.SDKConfig
 
 type Config = internalconfig.Config
+
+type ToolEmulationConfig = toolemu.ToolEmulationConfig
+type ToolEmulationRule = toolemu.ToolEmulationRule
+type ToolEmulationTagGroup = toolemu.ToolEmulationTagGroup
 
 type StreamingConfig = internalconfig.StreamingConfig
 type TLSConfig = internalconfig.TLSConfig

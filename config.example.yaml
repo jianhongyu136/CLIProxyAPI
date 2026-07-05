@@ -500,6 +500,29 @@ nonstream-keepalive-interval: 0
 #   xai:
 #     - "grok-3-mini"
 
+# Optional: tool-call prompt-injection emulation.
+# When enabled, requests targeting the listed (provider, model) pairs have their
+# `tools`/`tool_choice` folded into the system prompt and any raw fenced tool
+# blocks emitted by the model are parsed back into structured tool calls so
+# downstream OpenAI/Responses clients see native tool-calling behavior on
+# upstream models that lack native support.
+# tool-emulation:
+#   enabled: false
+#   fence-token: cpa9x7q2                 # 4-32 chars: letters, digits, "_", "-"
+#   tag-group:                            # Raw protocol tags; each tag allows letters, digits, "_", "-"
+#     tool: CPA_TC
+#     arg: CPA_TA
+#     result: CPA_TR
+#   parse-retry: 1                       # extra attempts after the first; 0 disables retry
+#   on-parse-failure: parse_failed_to_content   # or "error"
+#   rules:
+#     # First-match-wins. Provider matches the executor identifier; models/model-aliases
+#     # accept glob patterns (filepath.Match). An empty models/model-aliases array means
+#     # "match all models for this provider".
+#     - provider: openai-compatibility
+#       models: ["*"]
+#       model-aliases: []
+
 # Optional payload configuration
 # payload:
 #   default: # Default rules only set parameters when they are missing in the payload.

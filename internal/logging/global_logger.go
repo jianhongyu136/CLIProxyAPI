@@ -83,11 +83,19 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 		}
 	}
 
+	var rawTextBlock string
+	if rawText, ok := entry.Data["raw_text"]; ok {
+		rawTextStr := fmt.Sprint(rawText)
+		if rawTextStr != "" {
+			rawTextBlock = "\nraw model output:\n" + rawTextStr
+		}
+	}
+
 	var formatted string
 	if entry.Caller != nil {
-		formatted = fmt.Sprintf("[%s] [%s] [%s] [%s:%d] %s%s\n", timestamp, reqID, levelStr, filepath.Base(entry.Caller.File), entry.Caller.Line, message, fieldsStr)
+		formatted = fmt.Sprintf("[%s] [%s] [%s] [%s:%d] %s%s%s\n", timestamp, reqID, levelStr, filepath.Base(entry.Caller.File), entry.Caller.Line, message, fieldsStr, rawTextBlock)
 	} else {
-		formatted = fmt.Sprintf("[%s] [%s] [%s] %s%s\n", timestamp, reqID, levelStr, message, fieldsStr)
+		formatted = fmt.Sprintf("[%s] [%s] [%s] %s%s%s\n", timestamp, reqID, levelStr, message, fieldsStr, rawTextBlock)
 	}
 	buffer.WriteString(formatted)
 
