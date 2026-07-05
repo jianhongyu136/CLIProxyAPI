@@ -1312,6 +1312,21 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 	return payload
 }
 
+func finalizeClaudeToolEmuFoldedBody(body []byte) []byte {
+	body = enforceCacheControlLimit(body, 4)
+	body = normalizeCacheControlTTL(body)
+	return body
+}
+
+func isToolEmuInjectionCacheBlock(item gjson.Result) bool {
+	text := item.Get("text")
+	if text.Type != gjson.String {
+		return false
+	}
+	value := text.String()
+	return strings.Contains(value, "<tools_doc>") && strings.Contains(value, "<tool_protocol>")
+}
+
 // enforceCacheControlLimit removes excess cache_control blocks from a payload
 // so the total does not exceed the Anthropic API limit (currently 4).
 //
@@ -1325,9 +1340,10 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 //
 //	Phase 1: system blocks earliest-first, preserving the last one.
 //	Phase 2: tool blocks earliest-first, preserving the last one.
-//	Phase 3: message content blocks earliest-first.
+//	Phase 3: message content blocks earliest-first, preserving tool-emulation injection blocks.
 //	Phase 4: remaining system blocks (last system).
 //	Phase 5: remaining tool blocks (last tool).
+//	Phase 6: protected tool-emulation injection blocks only if unavoidable.
 func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
@@ -1339,6 +1355,41 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 	}
 
 	excess := total - maxBlocks
+	deleteMessageCacheControls := func(preserveToolEmuInjection bool) {
+		messages := gjson.GetBytes(payload, "messages")
+		if !messages.IsArray() {
+			return
+		}
+		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
+			if excess <= 0 {
+				return false
+			}
+			content := msg.Get("content")
+			if !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(itemIdx, item gjson.Result) bool {
+				if excess <= 0 {
+					return false
+				}
+				if !item.Get("cache_control").Exists() {
+					return true
+				}
+				if preserveToolEmuInjection && isToolEmuInjectionCacheBlock(item) {
+					return true
+				}
+				path := fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(itemIdx.Int()))
+				updated, errDel := sjson.DeleteBytes(payload, path)
+				if errDel != nil {
+					return true
+				}
+				payload = updated
+				excess--
+				return true
+			})
+			return true
+		})
+	}
 
 	system := gjson.GetBytes(payload, "system")
 	if system.IsArray() {
@@ -1412,35 +1463,7 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 		return payload
 	}
 
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(itemIdx.Int()))
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-			return true
-		})
-	}
+	deleteMessageCacheControls(true)
 	if excess <= 0 {
 		return payload
 	}
@@ -1487,6 +1510,11 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 			return true
 		})
 	}
+	if excess <= 0 {
+		return payload
+	}
+
+	deleteMessageCacheControls(false)
 
 	return payload
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -172,8 +173,64 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			return resp, fmt.Errorf("apply Claude credential metadata: %w", err)
 		}
 	}
-	cchBilling := ""
+	// Runs on the finished body: payload rules can rewrite model and messages
+	// long after translation, so an earlier check would not describe the request
+	// that is about to be sent.
+	if errMidSystem := validateClaudeMidSystemMessageModel(bodyForUpstream, confirmedClaudeCode, isAnthropicUpstreamBase(baseURL)); errMidSystem != nil {
+		return resp, errMidSystem
+	}
+	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
+
+	if helps.ToolEmuActive(ctx, e.Identifier(), baseModel, requestedModel, bodyForUpstream) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		send := e.buildClaudeToolEmuSend(
+			auth,
+			url,
+			apiKey,
+			extraBetas,
+			cchSigning,
+			claudeCodeDetection.Entrypoint,
+			claudeCodeDetection.HelperProfile,
+			incomingHeaders,
+			confirmedClaudeCode && !cloaked,
+			claudeSessionID,
+		)
+		outcome, errEmu := helps.RunToolEmu(ctx, bodyForUpstream, toolemu.ShapeClaudeMessages, e.Identifier(), policy, send)
+		if errEmu != nil {
+			return resp, errEmu
+		}
+		var errRestore error
+		outcome.BuiltBody, errRestore = restoreClaudeOAuthToolNamesFromResponse(outcome.BuiltBody, oauthToolNamesReverseMap)
+		if errRestore != nil {
+			errRestore = fmt.Errorf("restore Claude OAuth tool name from response: %w", errRestore)
+			helps.RecordAPIResponseError(ctx, e.cfg, errRestore)
+			return resp, errRestore
+		}
+		outcome.BuiltBody = e.restoreResponseModel(outcome.BuiltBody, req.Model)
+		commitClaudeDiagnostics(diagnosticsState, claudeMessageIDFromResponse(outcome.BuiltBody))
+		reporter.Publish(ctx, helps.ParseClaudeUsage(outcome.BuiltBody))
+		reporter.EnsurePublished(ctx)
+		var param any
+		out := sdktranslator.TranslateNonStream(
+			ctx,
+			to,
+			responseFormat,
+			req.Model,
+			opts.OriginalRequest,
+			outcome.Folded,
+			outcome.BuiltBody,
+			&param,
+		)
+		resp = cliproxyexecutor.Response{Payload: out}
+		return resp, nil
+	}
+
 	if cchSigning {
+		cchBilling := ""
 		if !claudeCodeDetection.HelperProfile || claudeBodyNeedsBillingFallback(bodyForUpstream) {
 			cchBilling = claudeCCHFallbackBillingHeader(ctx, e.cfg, bodyForUpstream, claudeCodeDetection.Entrypoint)
 		}
@@ -182,13 +239,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			return resp, fmt.Errorf("finalize Claude CCH: %w", err)
 		}
 	}
-	// Runs on the finished body: payload rules can rewrite model and messages
-	// long after translation, so an earlier check would not describe the request
-	// that is about to be sent.
-	if errMidSystem := validateClaudeMidSystemMessageModel(bodyForUpstream, confirmedClaudeCode, isAnthropicUpstreamBase(baseURL)); errMidSystem != nil {
-		return resp, errMidSystem
-	}
-	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return resp, err
