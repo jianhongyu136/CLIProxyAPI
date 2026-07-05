@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/toolemu"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -225,8 +226,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		matcher := helps.BuildSensitiveWordMatcher(wireSettings.sensitiveWords)
 		bodyForUpstream = helps.ObfuscateSensitiveWords(bodyForUpstream, matcher)
 	}
+	toolEmuActive := helps.ToolEmuActive(ctx, e.Identifier(), baseModel, helps.PayloadRequestedModel(opts, req.Model), bodyForUpstream)
 	cchBilling := ""
-	if cchSigning {
+	if cchSigning && !toolEmuActive {
 		if !claudeCodeDetection.HelperProfile || claudeBodyNeedsBillingFallback(bodyForUpstream) {
 			cchBilling = claudeCCHFallbackBillingHeader(ctx, e.cfg, bodyForUpstream, claudeCodeDetection.Entrypoint)
 		}
@@ -239,29 +241,91 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if claudeCompactionSummaryFromContext(ctx) {
 		bodyForUpstream = finalizeClaudeCompactionSummaryBody(bodyForUpstream)
 	}
-	// User rules match the fully prepared business body and are applied only once.
-	var touchedPayloadPaths map[string]bool
-	bodyForUpstream, touchedPayloadPaths = helps.ApplyPayloadConfigWithTrackedPaths(
-		e.cfg, baseModel, to.String(), from.String(), "", bodyForUpstream, originalTranslated,
-		helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers,
-		"diagnostics",
-	)
-	if touchedPayloadPaths["diagnostics"] {
-		diagnosticsState = claudeDiagnosticsRequestState{}
-	}
-	extraBetas, bodyForUpstream = extractAndRemoveBetas(bodyForUpstream)
-	bodyForUpstream = stripPromptCacheOptions(bodyForUpstream)
-	if cchSigning {
-		bodyForUpstream, err = signAnthropicMessagesBody(bodyForUpstream)
-		if err != nil {
-			return resp, fmt.Errorf("sign Claude CCH: %w", err)
+	// Finalize each actual send after folding, including parse retries.
+	finalizeBody := func(payload []byte) ([]byte, []string, error) {
+		// User rules match the fully prepared business body and are applied only once.
+		var touchedPayloadPaths map[string]bool
+		payload, touchedPayloadPaths = helps.ApplyPayloadConfigWithTrackedPaths(
+			e.cfg, baseModel, to.String(), from.String(), "", payload, originalTranslated,
+			helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers,
+			"diagnostics",
+		)
+		if touchedPayloadPaths["diagnostics"] {
+			diagnosticsState = claudeDiagnosticsRequestState{}
 		}
+		betas, payload := extractAndRemoveBetas(payload)
+		payload = stripPromptCacheOptions(payload)
+		if cchSigning {
+			var errSign error
+			payload, errSign = signAnthropicMessagesBody(payload)
+			if errSign != nil {
+				return nil, nil, fmt.Errorf("sign Claude CCH: %w", errSign)
+			}
+		}
+		if errMidSystem := validateClaudeMidSystemMessageModel(payload, confirmedClaudeCode, isAnthropicUpstreamBase(baseURL)); errMidSystem != nil {
+			return nil, nil, errMidSystem
+		}
+		reporter.SetTranslatedReasoningEffort(payload, to.String())
+		return payload, betas, nil
 	}
-	// Read-only validation must observe the final configured model and messages.
-	if errMidSystem := validateClaudeMidSystemMessageModel(bodyForUpstream, confirmedClaudeCode, isAnthropicUpstreamBase(baseURL)); errMidSystem != nil {
-		return resp, errMidSystem
+
+	if toolEmuActive {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		var responseHeaders http.Header
+		send := e.buildClaudeToolEmuSend(
+			auth,
+			url,
+			apiKey,
+			finalizeBody,
+			cchSigning,
+			claudeCodeDetection.Entrypoint,
+			claudeCodeDetection.HelperProfile,
+			incomingHeaders,
+			confirmedClaudeCode && !cloaked,
+			claudeSessionID,
+			&responseHeaders,
+		)
+		outcome, errEmu := helps.RunToolEmu(ctx, bodyForUpstream, toolemu.ShapeClaudeMessages, e.Identifier(), policy, send)
+		if errEmu != nil {
+			return resp, errEmu
+		}
+		var errRestore error
+		outcome.BuiltBody, errRestore = restoreClaudeOAuthToolNamesFromResponse(outcome.BuiltBody, oauthToolNamesReverseMap)
+		if errRestore != nil {
+			errRestore = fmt.Errorf("restore Claude OAuth tool name from response: %w", errRestore)
+			helps.RecordAPIResponseError(ctx, e.cfg, errRestore)
+			return resp, errRestore
+		}
+		outcome.BuiltBody = e.restoreResponseModel(outcome.BuiltBody, req.Model)
+		commitClaudeContinuity(diagnosticsState, claudeMessageIDFromResponse(outcome.BuiltBody), helps.HeaderValueCaseInsensitive(responseHeaders, "request-id"))
+		reporter.Publish(ctx, helps.ParseClaudeUsage(outcome.BuiltBody))
+		reporter.EnsurePublished(ctx)
+		var param any
+		out := sdktranslator.TranslateNonStream(
+			ctx,
+			to,
+			responseFormat,
+			req.Model,
+			opts.OriginalRequest,
+			outcome.Folded,
+			outcome.BuiltBody,
+			&param,
+		)
+		if responseFormat == sdktranslator.FormatOpenAIResponse {
+			out = helps.EnsureResponsesUsageDetails(out)
+		}
+		resp = cliproxyexecutor.Response{Payload: out, Headers: responseHeaders}
+		return resp, nil
 	}
-	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
+
+	bodyForUpstream, extraBetas, err = finalizeBody(bodyForUpstream)
+	if err != nil {
+		return resp, err
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return resp, err

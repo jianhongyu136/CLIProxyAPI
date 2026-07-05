@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/toolemu"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -175,6 +176,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
+	toolemu.Default.Replace(cfg.ToolEmulation.DefaultsApplied())
 
 	registrationCtx := coreauth.WithSkipPersist(ctx)
 	s.syncPluginRuntimeConfigForConfig(registrationCtx, cfg)
