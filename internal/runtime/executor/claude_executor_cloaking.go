@@ -4140,6 +4140,26 @@ func normalizeCacheControlTTLDoc(doc *ojson.Doc) bool {
 	return modified
 }
 
+func finalizeClaudeToolEmuFoldedBody(body []byte) []byte {
+	doc := ojson.NewDoc(body)
+	finalizeClaudeToolEmuFoldedBodyDoc(doc)
+	return doc.Bytes()
+}
+
+func finalizeClaudeToolEmuFoldedBodyDoc(doc *ojson.Doc) {
+	enforceCacheControlLimitDoc(doc, 4)
+	normalizeCacheControlTTLDoc(doc)
+}
+
+func isToolEmuInjectionCacheBlock(item ojson.Result) bool {
+	text := item.Get("text")
+	if text.Type != ojson.String {
+		return false
+	}
+	value := text.String()
+	return strings.Contains(value, "<tools_doc>") && strings.Contains(value, "<tool_protocol>")
+}
+
 // enforceCacheControlLimit removes excess cache_control blocks from a payload
 // so the total does not exceed the Anthropic API limit (currently 4).
 //
@@ -4153,9 +4173,10 @@ func normalizeCacheControlTTLDoc(doc *ojson.Doc) bool {
 //
 //	Phase 1: system blocks earliest-first, preserving the last one.
 //	Phase 2: tool blocks earliest-first, preserving the last one.
-//	Phase 3: message content blocks earliest-first.
+//	Phase 3: message content blocks earliest-first, preserving tool-emulation injection blocks.
 //	Phase 4: remaining system blocks (last system).
 //	Phase 5: remaining tool blocks (last tool).
+//	Phase 6: protected tool-emulation injection blocks only if unavoidable.
 func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 	if len(payload) == 0 || !ojson.ValidBytes(payload) {
 		return payload
@@ -4178,7 +4199,7 @@ func enforceCacheControlLimitDoc(doc *ojson.Doc, maxBlocks int) bool {
 		maxBlocks--
 	}
 
-	var toolPaths, systemPaths, messagePaths, topPaths []string
+	var toolPaths, systemPaths, messagePaths, topPaths, toolEmuMessagePaths []string
 	forEachClaudeCacheControlPathDoc(doc, func(path string, cc ojson.Result) bool {
 		if !isValidClaudeCacheControl(cc) {
 			return true
@@ -4228,7 +4249,17 @@ func enforceCacheControlLimitDoc(doc *ojson.Doc, maxBlocks int) bool {
 	if excess <= 0 {
 		return changed
 	}
-	deleteList(messagePaths)
+	// Inspect message content only when eviction is actually necessary.
+	ordinaryMessagePaths := messagePaths[:0]
+	for _, path := range messagePaths {
+		blockPath := strings.TrimSuffix(path, ".cache_control")
+		if isToolEmuInjectionCacheBlock(doc.Get(blockPath)) {
+			toolEmuMessagePaths = append(toolEmuMessagePaths, path)
+		} else {
+			ordinaryMessagePaths = append(ordinaryMessagePaths, path)
+		}
+	}
+	deleteList(ordinaryMessagePaths)
 	if excess <= 0 {
 		return changed
 	}
@@ -4245,6 +4276,10 @@ func enforceCacheControlLimitDoc(doc *ojson.Doc, maxBlocks int) bool {
 		return changed
 	}
 	deleteList(topPaths)
+	if excess <= 0 {
+		return changed
+	}
+	deleteList(toolEmuMessagePaths)
 	return changed
 }
 
