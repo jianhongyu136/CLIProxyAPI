@@ -924,6 +924,37 @@ func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, reverseMap map[strin
 	return reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
 }
 
+func restoreClaudeOAuthToolNamesFromStreamFrame(frame []byte, restoreLine func([]byte) []byte) []byte {
+	parts := bytes.SplitAfter(frame, []byte("\n"))
+	out := make([]byte, 0, len(frame))
+	changed := false
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		line := part
+		var suffix []byte
+		if bytes.HasSuffix(line, []byte("\n")) {
+			suffix = []byte("\n")
+			line = line[:len(line)-1]
+			if bytes.HasSuffix(line, []byte("\r")) {
+				suffix = []byte("\r\n")
+				line = line[:len(line)-1]
+			}
+		}
+		restored := restoreLine(line)
+		if !bytes.Equal(restored, line) {
+			changed = true
+		}
+		out = append(out, restored...)
+		out = append(out, suffix...)
+	}
+	if !changed {
+		return frame
+	}
+	return out
+}
+
 // remapOAuthToolNames represents every declared third-party client tool as a
 // semantic Claude Code MCP extension. Existing valid MCP names and explicit
 // typed Anthropic tools remain unchanged.

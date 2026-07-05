@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -74,6 +75,127 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	if helps.ToolEmuActive(ctx, e.Identifier(), baseModel, requestedModel, body) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		choice := toolemu.ExtractToolChoice(body, toolemu.ShapeOpenAIResponses)
+		tools, errTools := toolemu.ExtractToolSpecs(body, toolemu.ShapeOpenAIResponses)
+		if errTools != nil {
+			return nil, errTools
+		}
+		policy.Tools = tools
+		folded, errFold := toolemu.FoldRequest(body, toolemu.FoldOpts{
+			Shape:      toolemu.ShapeOpenAIResponses,
+			Provider:   e.Identifier(),
+			FenceToken: policy.FenceToken,
+			TagGroup:   policy.TagGroup,
+		})
+		if errFold != nil {
+			return nil, errFold
+		}
+		var identityState codexIdentityConfuseState
+		httpReq, upstreamBody, identityState, errReq := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, folded, opts.Headers)
+		if errReq != nil {
+			return nil, errReq
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		applyModelHeaderOverrides(httpReq.Header, baseModel)
+		applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      upstreamBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient = reporter.TrackHTTPClient(httpClient)
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			data, readErr := io.ReadAll(httpResp.Body)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+			if readErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+				return nil, readErr
+			}
+			data = applyCodexIdentityConfuseResponsePayload(data, identityState)
+			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
+				return nil, errClearReplay
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+			return nil, newCodexStatusErr(httpResp.StatusCode, data)
+		}
+		ctx = toolemu.MarkFolded(ctx, true)
+		out := make(chan cliproxyexecutor.StreamChunk)
+		go func() {
+			defer close(out)
+			defer func() {
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("codex executor: close response body error: %v", errClose)
+				}
+			}()
+			claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
+			var param any
+			meta := toolemu.UpstreamMeta{Provider: e.Identifier(), Model: baseModel}
+			upMeta, errStream := helps.RunToolEmuStream(ctx, meta, toolemu.ShapeOpenAIResponses, httpResp.Body, choice, policy, func(frame []byte) {
+				upstreamFrame := applyCodexIdentityConfuseResponsePayload(frame, identityState)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
+				translatedFrame := restoreCodexToolEmuStreamFrame(upstreamFrame, optimizeMultiAgentV2)
+				translatedFrame = applyCodexIdentityExposeResponsePayload(translatedFrame, identityState)
+				if data := codexToolEmuStreamFrameData(translatedFrame); gjson.GetBytes(data, "type").String() == "response.completed" {
+					cacheCodexReasoningReplayFromCompleted(replayScope, data)
+				}
+				chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, folded, translatedFrame, &param, claudeInputTokens)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			})
+			if len(upMeta.UsagePayload) > 0 {
+				wrapped := []byte(`{"type":"response.completed"}`)
+				wrapped, _ = sjson.SetRawBytes(wrapped, "response.usage", upMeta.UsagePayload)
+				if detail, ok := helps.ParseCodexUsage(wrapped); ok {
+					reporter.Publish(ctx, detail)
+				}
+			}
+			if errStream != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+				reporter.PublishFailure(ctx, errStream)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errStream}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			reporter.EnsurePublished(ctx)
+		}()
+		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	}
+
 	var identityState codexIdentityConfuseState
 	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body, opts.Headers)
 	if err != nil {
