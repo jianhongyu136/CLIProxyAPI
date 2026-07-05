@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/toolemu"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -131,6 +132,133 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, errSession
 	}
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	if helps.ToolEmuActiveDoc(ctx, e.Identifier(), baseModel, helps.PayloadRequestedModel(opts, req.Model), doc) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		choice := toolemu.ExtractToolChoiceDoc(doc, toolemu.ShapeOpenAIResponses)
+		tools, errTools := toolemu.ExtractToolSpecsDoc(doc, toolemu.ShapeOpenAIResponses)
+		if errTools != nil {
+			return nil, errTools
+		}
+		policy.Tools = tools
+		if errFold := toolemu.FoldRequestDoc(doc, toolemu.FoldOpts{Shape: toolemu.ShapeOpenAIResponses, Provider: e.Identifier(), FenceToken: policy.FenceToken, TagGroup: policy.TagGroup}); errFold != nil {
+			return nil, errFold
+		}
+		httpReq, upstreamBody, errReq := e.cacheHelperDoc(ctx, from, url, req, doc, auth, opts.Headers)
+		if errReq != nil {
+			return nil, errReq
+		}
+		body = upstreamBody
+		upstreamModel := strings.TrimSpace(doc.Get("model").String())
+		if upstreamModel != "" && upstreamModel != baseModel {
+			reporter.SetUpstreamModel(upstreamModel)
+		}
+		reporter.SetTranslatedReasoningEffort(upstreamBody, to.String())
+		prepareHeaders := func(request *http.Request) {
+			applyCodexHeaders(request, auth, apiKey, true, e.cfg, opts.Headers)
+			applyCodexRoutingHint(ctx, request.Header, auth, upstreamModel, upstreamBody, opts.Headers)
+			applyModelHeaderOverrides(request.Header, upstreamModel)
+			alignCodexContentEncoding(request)
+		}
+		prepareHeaders(httpReq)
+		if errValidate := helps.ValidateCodexHostedImageGenerationDoc(doc, httpReq.Header, e.cfg, !useSIWC && !codexAuthUsesAPIKey(auth)); errValidate != nil {
+			return nil, errValidate
+		}
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      upstreamBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
+		httpResp, errDo := doCodexRequest(httpClient, httpReq, upstreamBody, prepareHeaders, nil)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			data, readErr := io.ReadAll(httpResp.Body)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+			if readErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+				return nil, readErr
+			}
+			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
+				return nil, errClearReplay
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+			return nil, newCodexStatusErrWithHeadersAndCooling(httpResp.StatusCode, httpResp.Header, data, e.modelLevelCooling())
+		}
+		ctx = toolemu.MarkFolded(ctx, true)
+		out := make(chan cliproxyexecutor.StreamChunk)
+		go func() {
+			defer close(out)
+			defer func() {
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("codex executor: close response body error: %v", errClose)
+				}
+			}()
+			claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
+			var param any
+			meta := toolemu.UpstreamMeta{Provider: e.Identifier(), Model: baseModel}
+			upMeta, errStream := helps.RunToolEmuStream(ctx, meta, toolemu.ShapeOpenAIResponses, httpResp.Body, choice, policy, func(frame []byte) {
+				upstreamFrame := frame
+				observeCodexTokenEvent(reporter, codexToolEmuStreamFrameData(upstreamFrame))
+				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
+				translatedFrame := restoreCodexToolEmuStreamFrame(upstreamFrame, optimizeMultiAgentV2)
+				if data := codexToolEmuStreamFrameData(translatedFrame); ojson.GetBytesNoCopy(data, "type").String() == "response.completed" {
+					cacheCodexReasoningReplayFromCompleted(replayScope, data)
+				}
+				chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, upstreamBody, translatedFrame, &param, claudeInputTokens)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			})
+			if len(upMeta.UsagePayload) > 0 {
+				wrappedDoc := ojson.NewDocString(`{"type":"response.completed"}`)
+				_ = wrappedDoc.SetRawBytes("response.usage", upMeta.UsagePayload)
+				wrapped := wrappedDoc.Bytes()
+				if detail, ok := helps.ParseCodexUsage(wrapped); ok {
+					reporter.Publish(ctx, detail)
+				}
+			}
+			if errStream != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+				reporter.PublishFailure(ctx, errStream)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errStream}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			reporter.EnsurePublished(ctx)
+		}()
+		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	}
+
 	httpReq, upstreamBody, err := e.cacheHelperDoc(ctx, from, url, req, doc, auth, opts.Headers)
 	if err != nil {
 		return nil, err

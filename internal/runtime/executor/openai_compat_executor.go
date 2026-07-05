@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/toolemu"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -181,6 +182,37 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 		sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "openai compat executor", doc, true, resolveResponsesSignatureTargetModel(baseModel, req, opts), baseURL)
 	}
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
+	shape := toolemu.ShapeOpenAIChat
+	if opts.Alt == "responses/compact" {
+		shape = toolemu.ShapeOpenAIResponses
+	}
+	if helps.ToolEmuActiveDoc(ctx, e.Identifier(), baseModel, requestedModel, doc) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts))
+		var responseHeaders http.Header
+		send := e.buildToolEmuSend(ctx, auth, url, apiKey, opts.Headers, reporter, &responseHeaders)
+		outcome, errEmu := helps.RunToolEmuDoc(ctx, doc, shape, e.Identifier(), policy, send)
+		if errEmu != nil {
+			return resp, errEmu
+		}
+		reporter.Publish(ctx, helps.ParseOpenAIUsage(outcome.BuiltBody))
+		reporter.EnsurePublished(ctx)
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), outcome.Folded, outcome.BuiltBody, &param)
+		if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
+			return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		}
+		if responseFormat == sdktranslator.FormatOpenAIResponse {
+			out = helps.EnsureResponsesUsageDetails(out)
+		}
+		resp = cliproxyexecutor.Response{Payload: out, Headers: responseHeaders}
+		return resp, nil
+	}
+
 	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
 	translated = doc.Bytes()
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
@@ -424,6 +456,114 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	helps.SetBoolIfDifferentDoc(doc, "stream_options.include_usage", true)
+
+	if helps.ToolEmuActiveDoc(ctx, e.Identifier(), baseModel, requestedModel, doc) {
+		var toolEmuCfg toolemu.ToolEmulationConfig
+		if e.cfg != nil {
+			toolEmuCfg = e.cfg.ToolEmulation
+		}
+		policy := helps.ToolEmuRetryPolicy(toolEmuCfg)
+		choice := toolemu.ExtractToolChoiceDoc(doc, toolemu.ShapeOpenAIChat)
+		tools, errTools := toolemu.ExtractToolSpecsDoc(doc, toolemu.ShapeOpenAIChat)
+		if errTools != nil {
+			return nil, errTools
+		}
+		policy.Tools = tools
+		if errFold := toolemu.FoldRequestDoc(doc, toolemu.FoldOpts{Shape: toolemu.ShapeOpenAIChat, Provider: e.Identifier(), FenceToken: policy.FenceToken, TagGroup: policy.TagGroup}); errFold != nil {
+			return nil, errFold
+		}
+		url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+		helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
+		folded := doc.Bytes()
+		reporter.SetTranslatedReasoningEffort(folded, to.String())
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(folded))
+		if errReq != nil {
+			return nil, errReq
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if apiKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		ensureOpenAICompatUserAgent(httpReq, opts.Headers)
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		util.ApplyCustomHeadersFromAttrs(httpReq, attrs, opts.Headers)
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Cache-Control", "no-cache")
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      folded,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			b, _ := io.ReadAll(httpResp.Body)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("openai compat executor: close response body error: %v", errClose)
+			}
+			return nil, newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
+		}
+		ctx = toolemu.MarkFolded(ctx, true)
+		out := make(chan cliproxyexecutor.StreamChunk)
+		go func() {
+			defer close(out)
+			defer func() {
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close response body error: %v", errClose)
+				}
+			}()
+			var param any
+			meta := toolemu.UpstreamMeta{Provider: e.Identifier(), Model: baseModel}
+			_, errStream := helps.RunToolEmuStream(ctx, meta, toolemu.ShapeOpenAIChat, httpResp.Body, choice, policy, func(frame []byte) {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, frame)
+				if detail, ok := helps.ParseOpenAIStreamUsage(frame); ok {
+					reporter.Publish(ctx, detail)
+				}
+				chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), folded, frame, &param)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			})
+			if errStream != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+				reporter.PublishFailure(ctx, errStream)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errStream}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			reporter.EnsurePublished(ctx)
+		}()
+		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
@@ -1138,6 +1278,76 @@ func (e *OpenAICompatExecutor) applyPromptCacheKeyWithCompatDoc(ctx context.Cont
 	promptCacheKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()
 	helps.SetStringIfDifferentDoc(doc, "prompt_cache_key", promptCacheKey)
 	return nil
+}
+
+// buildToolEmuSend returns a UpstreamSendFunc closure that posts a folded
+// payload to the OpenAI-compatible upstream and returns the body bytes. Used
+// by toolemu.ParseAndRetry to drive the fold-send-parse loop.
+func (e *OpenAICompatExecutor) buildToolEmuSend(ctx context.Context, auth *cliproxyauth.Auth, url, apiKey string, incomingHeaders http.Header, reporter *helps.UsageReporter, responseHeaders *http.Header) toolemu.UpstreamSendFunc {
+	provider := e.Identifier()
+	return func(sctx context.Context, body []byte) ([]byte, error) {
+		doc := ojson.NewDoc(body)
+		helps.FinalizePayloadDoc(sctx, doc)
+		body = doc.Bytes()
+		reporter.SetTranslatedReasoningEffort(body, "openai")
+		httpReq, errReq := http.NewRequestWithContext(sctx, http.MethodPost, url, bytes.NewReader(body))
+		if errReq != nil {
+			return nil, errReq
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if apiKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		ensureOpenAICompatUserAgent(httpReq, incomingHeaders)
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		util.ApplyCustomHeadersFromAttrs(httpReq, attrs, incomingHeaders)
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(sctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      body,
+			Provider:  provider,
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		client := helps.NewProxyAwareHTTPClient(sctx, e.cfg, auth, 0)
+		client = reporter.TrackHTTPClient(client)
+		httpResp, errDo := client.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(sctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		defer func() {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("openai compat executor: close response body error: %v", errClose)
+			}
+		}()
+		helps.RecordAPIResponseMetadata(sctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if responseHeaders != nil {
+			*responseHeaders = httpResp.Header.Clone()
+		}
+		respBody, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(sctx, e.cfg, errRead)
+			return nil, errRead
+		}
+		helps.AppendAPIResponseChunk(sctx, e.cfg, respBody)
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			return nil, newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, respBody)
+		}
+		return respBody, nil
+	}
 }
 
 func (e *OpenAICompatExecutor) resolveCredentials(auth *cliproxyauth.Auth) (baseURL, apiKey string) {
