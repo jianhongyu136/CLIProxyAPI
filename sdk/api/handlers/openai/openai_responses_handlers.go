@@ -703,14 +703,15 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
-
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	stopPrelude := h.StartStreamingPreludeKeepAlive(c, flusher, cliCtx, setSSEHeaders)
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	stopPrelude()
 	isCodexClient := isCodexResponsesClientRequest(c)
 	failureEvent := "error"
 	if isCodexClient {
@@ -719,7 +720,81 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	framer := &responsesSSEFramer{failureEvent: failureEvent, isCodexClient: isCodexClient}
 	var initialOutput bytes.Buffer
 
+	writePreludeError := func(errMsg *interfaces.ErrorMessage) {
+		safeErrMsg := sanitizeResponsesInitialErrorMessage(errMsg)
+		framer.Flush(c.Writer)
+		status := http.StatusInternalServerError
+		if safeErrMsg != nil && safeErrMsg.StatusCode > 0 {
+			status = safeErrMsg.StatusCode
+		}
+		errText := responsesStreamErrorText(safeErrMsg, status)
+		if isCodexClient {
+			chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, 0)
+			_, _ = fmt.Fprintf(c.Writer, "\nevent: response.failed\ndata: %s\n\n", string(chunk))
+			return
+		}
+		chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
+		_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
+	}
+
+	var preludeFirstChunk []byte
+	if h.HandleStreamPrelude(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, upstreamHeaders, handlers.StreamPreludeOptions{
+		CommitHeaders: func() {
+			setSSEHeaders()
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		},
+		WriteFirstChunk: func(chunk []byte) {
+			preludeFirstChunk = chunk
+		},
+		WriteClosedBeforeData: func() {
+			message := "upstream stream closed before first payload"
+			errMsg := sanitizeResponsesInitialErrorMessage(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("%s", message)})
+			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+			writePreludeError(errMsg)
+		},
+		WritePreludeError: writePreludeError,
+		Continue: func(data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+			data = prependResponsesChunk(cliCtx, data, preludeFirstChunk)
+			h.forwardResponsesPeek(c, flusher, cliCancel, data, errs, upstreamHeaders, setSSEHeaders, framer, &initialOutput)
+		},
+	}) {
+		return
+	}
+
 	// Peek at the first complete SSE data frame.
+	h.forwardResponsesPeek(c, flusher, cliCancel, dataChan, errChan, upstreamHeaders, setSSEHeaders, framer, &initialOutput)
+}
+
+func prependResponsesChunk(ctx context.Context, data <-chan []byte, chunk []byte) <-chan []byte {
+	out := make(chan []byte)
+	go func() {
+		defer close(out)
+		select {
+		case out <- chunk:
+		case <-ctx.Done():
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case item, ok := <-data:
+				if !ok {
+					return
+				}
+				select {
+				case out <- item:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
+
+func (h *OpenAIResponsesAPIHandler) forwardResponsesPeek(c *gin.Context, flusher http.Flusher, cliCancel handlers.APIHandlerCancelFunc, dataChan <-chan []byte, errChan <-chan *interfaces.ErrorMessage, upstreamHeaders http.Header, setSSEHeaders func(), framer *responsesSSEFramer, initialOutput *bytes.Buffer) {
+	headersCommitted := c.Writer.Written() || c.Writer.Header().Get("Content-Type") == "text/event-stream"
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -731,14 +806,16 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				errChan = nil
 				continue
 			}
-			framer.Flush(&initialOutput)
+			framer.Flush(initialOutput)
 			safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
 			if framer.dataFrames == 0 {
 				safeErrMsg = sanitizeResponsesInitialErrorMessage(errMsg)
 			}
-			if safeErrMsg != nil && framer.dataFrames > 0 {
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			if safeErrMsg != nil && (framer.dataFrames > 0 || headersCommitted) {
+				if !headersCommitted {
+					setSSEHeaders()
+					handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				}
 				_, _ = c.Writer.Write(initialOutput.Bytes())
 				flusher.Flush()
 				pendingErrors := make(chan *interfaces.ErrorMessage, 1)
@@ -758,7 +835,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				framer.Flush(&initialOutput)
+				framer.Flush(initialOutput)
 				errMsg, hasPendingError := handlers.PendingStreamError(errChan)
 				if !hasPendingError && framer.terminalEvent == "" {
 					message := "upstream stream closed before first payload"
@@ -773,9 +850,11 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 					errMsg = sanitizeResponsesInitialErrorMessage(errMsg)
 				}
 
-				if framer.dataFrames > 0 {
-					setSSEHeaders()
-					handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				if framer.dataFrames > 0 || headersCommitted {
+					if !headersCommitted {
+						setSSEHeaders()
+						handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+					}
 					_, _ = c.Writer.Write(initialOutput.Bytes())
 					flusher.Flush()
 					if framer.terminalError != nil {
@@ -804,13 +883,15 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				return
 			}
 
-			framer.WriteChunk(&initialOutput, chunk)
+			framer.WriteChunk(initialOutput, chunk)
 			if framer.dataFrames == 0 {
 				continue
 			}
 
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			if !headersCommitted {
+				setSSEHeaders()
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			}
 			_, _ = c.Writer.Write(initialOutput.Bytes())
 			flusher.Flush()
 			if framer.terminalError != nil {
