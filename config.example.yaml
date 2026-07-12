@@ -417,8 +417,9 @@ ws-auth: true
 nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
-#   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
-#   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   keepalive-seconds: 15      # Default: 0 (disabled). <= 0 disables keep-alives.
+#   bootstrap-retries: 1       # Default: 0 (disabled). Retries before first byte is sent.
+#   prelude-keepalive: false   # Default: false. If true, SSE headers and a padded ": keep-alive" are flushed before the upstream stream is established. Requires keepalive-seconds > 0 and passthrough-headers: false; upstream headers are not available before this flush. Pre-stream errors then become SSE errors because the status is already committed.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.
