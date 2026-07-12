@@ -507,16 +507,53 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		flusher.Flush()
 		return true
 	}
-	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
+	keepAliveCfg := h.CurrentConfig()
+	// The prelude owns heartbeats when both keep-alive modes are enabled.
+	if handlers.StreamingPreludeKeepAliveEnabled(keepAliveCfg) {
+		keepAliveCfg = nil
+	}
+	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(keepAliveCfg)
 	defer stopKeepAlive()
+	stopPrelude := h.StartStreamingPreludeKeepAlive(c, flusher, cliCtx, commitSSE)
+	defer stopPrelude()
 
 	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(
 		c, cliCtx, func(err error) { cliCancel(err) }, h.HandlerType(), modelName, rawJSON, h.GetAlt(c), keepAliveC, writeKeepAlive,
 	)
+	stopPrelude()
 	if !okBootstrap {
 		return
 	}
 	upstreamHeaders = resolvedHeaders
+
+	var preludeHasFinishReason bool
+	if h.HandleStreamPrelude(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, upstreamHeaders, handlers.StreamPreludeOptions{
+		CommitHeaders: commitSSE,
+		WriteFirstChunk: func(chunk []byte) {
+			preludeHasFinishReason = chunkHasFinishReason(chunk)
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+		},
+		WriteClosedBeforeData: func() {
+			_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+		},
+		WritePreludeError: func(errMsg *interfaces.ErrorMessage) {
+			status := http.StatusInternalServerError
+			if errMsg != nil && errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			errText := http.StatusText(status)
+			if errMsg != nil && errMsg.Error != nil && errMsg.Error.Error() != "" {
+				errText = errMsg.Error.Error()
+			}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
+		},
+		Continue: func(data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, data, errs, preludeHasFinishReason)
+		},
+	}) {
+		return
+	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
@@ -666,16 +703,87 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		flusher.Flush()
 		return true
 	}
-	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
+	keepAliveCfg := h.CurrentConfig()
+	// The prelude owns heartbeats when both keep-alive modes are enabled.
+	if handlers.StreamingPreludeKeepAliveEnabled(keepAliveCfg) {
+		keepAliveCfg = nil
+	}
+	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(keepAliveCfg)
 	defer stopKeepAlive()
+	stopPrelude := h.StartStreamingPreludeKeepAlive(c, flusher, cliCtx, commitSSE)
+	defer stopPrelude()
 
 	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(
 		c, cliCtx, func(err error) { cliCancel(err) }, h.HandlerType(), modelName, chatCompletionsJSON, "", keepAliveC, writeKeepAlive,
 	)
+	stopPrelude()
 	if !okBootstrap {
 		return
 	}
 	upstreamHeaders = resolvedHeaders
+
+	var preludeHasFinishReason bool
+	if h.HandleStreamPrelude(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, upstreamHeaders, handlers.StreamPreludeOptions{
+		CommitHeaders: commitSSE,
+		WriteFirstChunk: func(chunk []byte) {
+			converted := convertChatCompletionsStreamChunkToCompletions(chunk)
+			if converted != nil {
+				preludeHasFinishReason = chunkHasFinishReason(converted)
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(converted))
+			}
+		},
+		WriteClosedBeforeData: func() {
+			_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+		},
+		WritePreludeError: func(errMsg *interfaces.ErrorMessage) {
+			status := http.StatusInternalServerError
+			if errMsg != nil && errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			errText := http.StatusText(status)
+			if errMsg != nil && errMsg.Error != nil && errMsg.Error.Error() != "" {
+				errText = errMsg.Error.Error()
+			}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
+		},
+		Continue: func(data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+			done := make(chan struct{})
+			var doneOnce sync.Once
+			stop := func() { doneOnce.Do(func() { close(done) }) }
+
+			convertedChan := make(chan []byte)
+			go func() {
+				defer close(convertedChan)
+				for {
+					select {
+					case <-done:
+						return
+					case chunk, ok := <-data:
+						if !ok {
+							return
+						}
+						converted := convertChatCompletionsStreamChunkToCompletions(chunk)
+						if converted == nil {
+							continue
+						}
+						select {
+						case <-done:
+							return
+						case convertedChan <- converted:
+						}
+					}
+				}
+			}()
+
+			h.handleStreamResult(c, flusher, func(err error) {
+				stop()
+				cliCancel(err)
+			}, convertedChan, errs, preludeHasFinishReason)
+		},
+	}) {
+		return
+	}
 
 	// Peek at the first chunk
 	for {
