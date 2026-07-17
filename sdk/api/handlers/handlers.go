@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"bytes"
+	stdcontext "context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -1096,14 +1098,23 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
-	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	streamInterceptorSession, streamSessionsSupported := openStreamChunkInterceptorSession(interceptorHost, execOptions.SkipInterceptorPluginID)
+	streamInterceptorsActive := streamInterceptorSession != nil
+	if !streamSessionsSupported {
+		streamInterceptorsActive = streamInterceptorsEnabled(interceptorHost)
+	}
+	streamID := ""
+	if streamInterceptorSession != nil {
+		streamID = uuid.NewString()
+	}
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
 	}
 	if streamInterceptorsActive {
-		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+		intercepted := interceptStreamChunkWithSession(ctx, streamInterceptorSession, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			StreamID:        streamID,
 			SourceFormat:    responseProtocol,
 			Model:           modelName,
 			RequestedModel:  originalRequestedModel,
@@ -1120,6 +1131,22 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
 		upstreamHeaders = make(http.Header)
 	}
+	endStreamInterceptors := func() {
+		if streamInterceptorSession == nil {
+			return
+		}
+		defer streamInterceptorSession.Close()
+		streamInterceptorSession.InterceptStreamChunk(streamFinalizerContext(ctx), pluginapi.StreamChunkInterceptRequest{
+			StreamID:        streamID,
+			SourceFormat:    responseProtocol,
+			Model:           modelName,
+			RequestedModel:  originalRequestedModel,
+			RequestHeaders:  cloneHeader(opts.Headers),
+			ResponseHeaders: cloneHeader(rawStreamHeaders),
+			ChunkIndex:      pluginapi.StreamChunkEndIndex,
+			Metadata:        opts.Metadata,
+		})
+	}
 
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1134,6 +1161,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		chunks = closed
 	}
 	go func() {
+		defer endStreamInterceptors()
 		defer close(dataChan)
 		defer close(errChan)
 		chunkIndex := 0
@@ -1158,19 +1186,23 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			}
 			payload := cloneBytes(chunk.Payload)
 			if streamInterceptorsActive {
-				intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+				interceptReq := pluginapi.StreamChunkInterceptRequest{
+					StreamID:        streamID,
 					SourceFormat:    responseProtocol,
 					Model:           modelName,
 					RequestedModel:  originalRequestedModel,
 					RequestHeaders:  cloneHeader(opts.Headers),
 					ResponseHeaders: cloneHeader(rawStreamHeaders),
-					OriginalRequest: cloneBytes(opts.OriginalRequest),
-					RequestBody:     cloneBytes(req.Payload),
 					Body:            payload,
-					HistoryChunks:   cloneByteSlices(historyChunks),
 					ChunkIndex:      chunkIndex,
 					Metadata:        opts.Metadata,
-				}, execOptions.SkipInterceptorPluginID)
+				}
+				if streamInterceptorSession == nil || !streamInterceptorSession.CanOmitHeavyFields() {
+					interceptReq.OriginalRequest = cloneBytes(opts.OriginalRequest)
+					interceptReq.RequestBody = cloneBytes(req.Payload)
+					interceptReq.HistoryChunks = cloneByteSlices(historyChunks)
+				}
+				intercepted := interceptStreamChunkWithSession(ctx, streamInterceptorSession, interceptorHost, interceptReq, execOptions.SkipInterceptorPluginID)
 				applyStreamHeaders(intercepted.Headers)
 				if len(intercepted.Body) > 0 {
 					payload = cloneBytes(intercepted.Body)
@@ -1298,7 +1330,15 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
-	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	streamInterceptorSession, streamSessionsSupported := openStreamChunkInterceptorSession(interceptorHost, execOptions.SkipInterceptorPluginID)
+	streamInterceptorsActive := streamInterceptorSession != nil
+	if !streamSessionsSupported {
+		streamInterceptorsActive = streamInterceptorsEnabled(interceptorHost)
+	}
+	streamID := ""
+	if streamInterceptorSession != nil {
+		streamID = uuid.NewString()
+	}
 	// Resolve bootstrap retries and header initialization before returning so the
 	// returned header snapshot is never modified by the stream goroutine.
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
@@ -1312,6 +1352,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	streamClosedBeforeRead := false
 	streamCanceledBeforeRead := false
 	streamHeaderInitialized := false
+	streamLifecycleStarted := false
 
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
@@ -1322,7 +1363,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			return
 		}
 		executedReq, executedOpts := executedRequest()
-		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+		streamLifecycleStarted = streamInterceptorSession != nil
+		intercepted := interceptStreamChunkWithSession(ctx, streamInterceptorSession, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			StreamID:        streamID,
 			SourceFormat:    responseProtocol,
 			Model:           normalizedModel,
 			RequestedModel:  originalRequestedModel,
@@ -1336,13 +1379,34 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		applyStreamHeaders(intercepted.Headers)
 		streamHeaderInitialized = true
 	}
+	endStreamInterceptors := func() {
+		if streamInterceptorSession == nil {
+			return
+		}
+		defer streamInterceptorSession.Close()
+		if !streamLifecycleStarted {
+			return
+		}
+		_, executedOpts := executedRequest()
+		streamInterceptorSession.InterceptStreamChunk(streamFinalizerContext(ctx), pluginapi.StreamChunkInterceptRequest{
+			StreamID:        streamID,
+			SourceFormat:    responseProtocol,
+			Model:           normalizedModel,
+			RequestedModel:  originalRequestedModel,
+			RequestHeaders:  cloneHeader(executedOpts.Headers),
+			ResponseHeaders: cloneHeader(rawStreamHeaders),
+			ChunkIndex:      pluginapi.StreamChunkEndIndex,
+			Metadata:        executedOpts.Metadata,
+		})
+	}
 
 	transformStreamPayload := func(payload []byte, chunkIndex *int, historyChunks [][]byte) ([]byte, bool, *interfaces.ErrorMessage) {
 		applyStreamHeaderInit()
 		payload = cloneBytes(payload)
 		if streamInterceptorsActive {
 			executedReq, executedOpts := executedRequest()
-			intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			interceptReq := pluginapi.StreamChunkInterceptRequest{
+				StreamID:        streamID,
 				SourceFormat:    responseProtocol,
 				Model:           normalizedModel,
 				RequestedModel:  originalRequestedModel,
@@ -1354,7 +1418,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				HistoryChunks:   cloneByteSlices(historyChunks),
 				ChunkIndex:      *chunkIndex,
 				Metadata:        executedOpts.Metadata,
-			}, execOptions.SkipInterceptorPluginID)
+			}
+			if streamInterceptorSession != nil && streamInterceptorSession.CanOmitHeavyFields() {
+				interceptReq.OriginalRequest = nil
+				interceptReq.RequestBody = nil
+				interceptReq.HistoryChunks = nil
+			}
+			intercepted := interceptStreamChunkWithSession(ctx, streamInterceptorSession, interceptorHost, interceptReq, execOptions.SkipInterceptorPluginID)
 			applyStreamHeaders(intercepted.Headers)
 			if len(intercepted.Body) > 0 {
 				payload = cloneBytes(intercepted.Body)
@@ -1479,6 +1549,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 
 	go func() {
+		defer endStreamInterceptors()
 		defer close(dataChan)
 		defer close(errChan)
 		if streamCanceledBeforeRead {
@@ -2061,6 +2132,24 @@ func streamInterceptorsEnabled(host PluginInterceptorHost) bool {
 	return true
 }
 
+func openStreamChunkInterceptorSession(host PluginInterceptorHost, skipPluginID string) (pluginapi.StreamChunkInterceptorSession, bool) {
+	if host == nil {
+		return nil, false
+	}
+	opener, ok := host.(pluginapi.StreamChunkInterceptorSessionHost)
+	if !ok {
+		return nil, false
+	}
+	return opener.OpenStreamChunkInterceptorSession(skipPluginID), true
+}
+
+func streamFinalizerContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return stdcontext.WithoutCancel(ctx)
+}
+
 func requestInterceptorsEnabled(host PluginInterceptorHost) bool {
 	if host == nil {
 		return false
@@ -2165,6 +2254,13 @@ func interceptResponse(ctx context.Context, host PluginInterceptorHost, req plug
 		}
 	}
 	return host.InterceptResponse(ctx, req)
+}
+
+func interceptStreamChunkWithSession(ctx context.Context, session pluginapi.StreamChunkInterceptorSession, host PluginInterceptorHost, req pluginapi.StreamChunkInterceptRequest, skipPluginID string) pluginapi.StreamChunkInterceptResponse {
+	if session != nil {
+		return session.InterceptStreamChunk(ctx, req)
+	}
+	return interceptStreamChunk(ctx, host, req, skipPluginID)
 }
 
 func interceptStreamChunk(ctx context.Context, host PluginInterceptorHost, req pluginapi.StreamChunkInterceptRequest, skipPluginID string) pluginapi.StreamChunkInterceptResponse {
