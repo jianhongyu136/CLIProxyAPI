@@ -246,14 +246,56 @@ func registeredXAIImagesModel(model string) (string, bool) {
 	return "", false
 }
 
+func isXAIImagesProviderPrefix(prefix string) bool {
+	switch strings.ToLower(strings.TrimSpace(prefix)) {
+	case "xai", "x-ai", "grok":
+		return true
+	default:
+		return false
+	}
+}
+
+func isReservedImagesModelPrefix(prefix string) bool {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if isXAIImagesProviderPrefix(prefix) {
+		return true
+	}
+	switch prefix {
+	case "codex", "openai", "claude", "gemini", "vertex", "aistudio", "antigravity", "kimi", "devin", "meta", "muse":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripCustomImagesModelPrefix(model string) string {
+	model = strings.TrimSpace(model)
+	for {
+		idx := strings.Index(model, "/")
+		if idx <= 0 || idx >= len(model)-1 {
+			return model
+		}
+		prefix := strings.TrimSpace(model[:idx])
+		if prefix == "" {
+			model = strings.TrimSpace(model[idx+1:])
+			continue
+		}
+		if isReservedImagesModelPrefix(prefix) {
+			return model
+		}
+		model = strings.TrimSpace(model[idx+1:])
+	}
+}
+
 func isXAIImagesModel(model string) bool {
+	model = stripCustomImagesModelPrefix(model)
 	prefix, baseModel := imagesModelParts(model)
 	if !isXAIImagesBaseModel(baseModel) {
 		return false
 	}
 
 	trimmedPrefix := strings.ToLower(strings.TrimSpace(prefix))
-	if trimmedPrefix == "" || trimmedPrefix == "xai" || trimmedPrefix == "x-ai" || trimmedPrefix == "grok" {
+	if trimmedPrefix == "" || isXAIImagesProviderPrefix(trimmedPrefix) {
 		return true
 	}
 	if _, ok := registeredXAIImagesModel(prefix + "/" + canonicalXAIImagesModel(model)); ok {
@@ -1222,11 +1264,23 @@ func buildImagesAPIResponseFromXAI(payload []byte, responseFormat string) ([]byt
 }
 
 func (h *OpenAIAPIHandler) handleXAIImages(c *gin.Context, xaiReq []byte, imageModel string, responseFormat string, streamPrefix string, stream bool) {
+	routingInput := strings.TrimSpace(imageModel)
+	strippedModel := stripCustomImagesModelPrefix(routingInput)
+	if strippedModel != routingInput {
+		canonical := canonicalXAIImagesModel(routingInput)
+		prefix, _ := imagesModelParts(routingInput)
+		if _, ok := registeredXAIImagesModel(prefix + "/" + canonical); !ok {
+			if _, ok = registeredXAIImagesModel(routingInput); !ok {
+				routingInput = strippedModel
+			}
+		}
+	}
+	routingModel := h.routingXAIImagesModel(routingInput)
 	if stream {
-		h.streamXAIImages(c, xaiReq, imageModel, responseFormat, streamPrefix)
+		h.streamXAIImages(c, xaiReq, routingModel, responseFormat, streamPrefix)
 		return
 	}
-	h.collectXAIImages(c, xaiReq, imageModel, responseFormat)
+	h.collectXAIImages(c, xaiReq, routingModel, responseFormat)
 }
 
 func (h *OpenAIAPIHandler) handleOpenAICompatImages(c *gin.Context, compatReq []byte, imageModel string, responseFormat string, streamPrefix string, stream bool) {
@@ -1513,12 +1567,12 @@ func (h *OpenAIAPIHandler) streamOpenAICompatImages(c *gin.Context, compatReq []
 	}
 }
 
-func (h *OpenAIAPIHandler) collectXAIImages(c *gin.Context, xaiReq []byte, imageModel string, responseFormat string) {
-	model := strings.TrimSpace(imageModel)
+func (h *OpenAIAPIHandler) collectXAIImages(c *gin.Context, xaiReq []byte, routingModel string, responseFormat string) {
+	model := strings.TrimSpace(routingModel)
 	if model == "" {
 		model = strings.TrimSpace(gjson.GetBytes(xaiReq, "model").String())
 	}
-	h.collectImagesWithModel(c, xaiReq, h.routingXAIImagesModel(model), responseFormat)
+	h.collectImagesWithModel(c, xaiReq, model, responseFormat)
 }
 
 func (h *OpenAIAPIHandler) collectImagesWithModel(c *gin.Context, imageReq []byte, model string, responseFormat string) {
@@ -1553,12 +1607,12 @@ func (h *OpenAIAPIHandler) collectImagesWithModel(c *gin.Context, imageReq []byt
 	cliCancel(nil)
 }
 
-func (h *OpenAIAPIHandler) streamXAIImages(c *gin.Context, xaiReq []byte, imageModel string, responseFormat string, streamPrefix string) {
-	model := strings.TrimSpace(imageModel)
+func (h *OpenAIAPIHandler) streamXAIImages(c *gin.Context, xaiReq []byte, routingModel string, responseFormat string, streamPrefix string) {
+	model := strings.TrimSpace(routingModel)
 	if model == "" {
 		model = strings.TrimSpace(gjson.GetBytes(xaiReq, "model").String())
 	}
-	h.streamImagesWithModel(c, xaiReq, h.routingXAIImagesModel(model), responseFormat, streamPrefix)
+	h.streamImagesWithModel(c, xaiReq, model, responseFormat, streamPrefix)
 }
 
 func (h *OpenAIAPIHandler) streamImagesWithModel(c *gin.Context, imageReq []byte, model string, responseFormat string, streamPrefix string) {
