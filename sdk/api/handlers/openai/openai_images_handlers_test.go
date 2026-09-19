@@ -69,10 +69,14 @@ func TestImagesModelValidationAllowsGPTImageAndXAIModels(t *testing.T) {
 		"codex/gpt-image-2.5",
 		"grok-imagine-image",
 		"xai/grok-imagine-image",
+		"custom/grok-imagine-image",
+		"custom/xai/grok-imagine-image",
 		"grok-imagine-image-quality",
 		"xai/grok-imagine-image-quality",
+		"custom/grok-imagine-image-quality",
 		"grok-imagine-image-2.0",
 		"xai/grok-imagine-image-2.0",
+		"custom/grok-imagine-image-2.0",
 	} {
 		if !isSupportedImagesModel(model) {
 			t.Fatalf("expected %s to be supported", model)
@@ -83,6 +87,9 @@ func TestImagesModelValidationAllowsGPTImageAndXAIModels(t *testing.T) {
 	}
 	if isSupportedImagesModel("codex/grok-imagine-image") {
 		t.Fatal("expected codex/grok-imagine-image to be rejected")
+	}
+	if isSupportedImagesModel("custom/codex/grok-imagine-image") {
+		t.Fatal("expected custom/codex/grok-imagine-image to be rejected")
 	}
 }
 
