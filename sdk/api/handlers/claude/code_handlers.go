@@ -239,7 +239,6 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -262,16 +261,46 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		flusher.Flush()
 		return true
 	}
-	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
+	keepAliveCfg := h.CurrentConfig()
+	// The prelude owns heartbeats when both keep-alive modes are enabled.
+	if handlers.StreamingPreludeKeepAliveEnabled(keepAliveCfg) {
+		keepAliveCfg = nil
+	}
+	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(keepAliveCfg)
 	defer stopKeepAlive()
+	stopPrelude := h.StartStreamingPreludeKeepAlive(c, flusher, cliCtx, commitSSE)
+	defer stopPrelude()
 
 	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(
 		c, cliCtx, func(err error) { cliCancel(err) }, h.HandlerType(), modelName, rawJSON, "", keepAliveC, writeKeepAlive,
 	)
+	stopPrelude()
 	if !okBootstrap {
 		return
 	}
 	upstreamHeaders = resolvedHeaders
+
+	if h.HandleStreamPrelude(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, upstreamHeaders, handlers.StreamPreludeOptions{
+		CommitHeaders: commitSSE,
+		WriteFirstChunk: func(chunk []byte) {
+			_, _ = c.Writer.Write(chunk)
+		},
+		WriteClosedBeforeData: func() {},
+		WritePreludeError: func(errMsg *interfaces.ErrorMessage) {
+			status := http.StatusInternalServerError
+			if errMsg != nil && errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			c.Status(status)
+			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+		},
+		Continue: func(data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, data, errs)
+		},
+	}) {
+		return
+	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
