@@ -370,4 +370,10 @@ type StreamingConfig struct {
 	// SendKeepAliveBeforeFT controls whether SSE heartbeats are sent before the first token arrives
 	// when KeepAliveSeconds > 0. Default is false.
 	SendKeepAliveBeforeFT bool `yaml:"send-keepalive-before-ft,omitempty" json:"send-keepalive-before-ft,omitempty"`
+
+	// PreludeKeepAlive controls whether streaming handlers flush SSE headers and a padded heartbeat
+	// before the upstream stream is established, then continue heartbeats until the first payload.
+	// When enabled, errors that happen before the stream is established become SSE errors because the status is already committed.
+	// This only takes effect when KeepAliveSeconds is > 0 and PassthroughHeaders is false, because upstream headers are unavailable before the prelude is flushed. Default is false.
+	PreludeKeepAlive bool `yaml:"prelude-keepalive,omitempty" json:"prelude-keepalive,omitempty"`
 }
