@@ -4,6 +4,8 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import "github.com/router-for-me/CLIProxyAPI/v8/internal/toolemu"
+
 // ServerResponseCompression mirrors SDKConfig.ResponseCompression on the outer
 // Config so JSON and YAML round trips preserve server.response-compression.
 // The canonical storage remains SDKConfig.ResponseCompression; read the
@@ -209,4 +211,8 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+
+	// ToolEmulation enables prompt-injection based tool-call emulation for
+	// upstream models that do not support native tool calling.
+	ToolEmulation toolemu.ToolEmulationConfig `yaml:"tool-emulation" json:"tool-emulation,omitempty"`
 }

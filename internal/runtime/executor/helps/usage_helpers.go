@@ -2681,12 +2681,18 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 func ParseClaudeUsage(data []byte) usage.Detail {
 	root := gjson.ParseBytes(data)
 	usageNode := root.Get("usage")
-	if !usageNode.Exists() {
-		return usage.Detail{}
+	if usageNode.Exists() {
+		detail := parseClaudeUsageNode(usageNode)
+		applyClaudeContentBlocksUsage(&detail, root.Get("content"))
+		return detail
 	}
-	detail := parseClaudeUsageNode(usageNode)
-	applyClaudeContentBlocksUsage(&detail, root.Get("content"))
-	return detail
+	if root.Get("input_tokens").Exists() ||
+		root.Get("output_tokens").Exists() ||
+		root.Get("cache_read_input_tokens").Exists() ||
+		root.Get("cache_creation_input_tokens").Exists() {
+		return parseClaudeUsageNode(root)
+	}
+	return usage.Detail{}
 }
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
