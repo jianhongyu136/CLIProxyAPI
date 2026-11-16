@@ -483,10 +483,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 	modelName := strings.Clone(ojson.GetBytesNoCopy(rawJSON, "model").String())
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
+		handlers.SetSSEHeaders(c)
 	}
 	var upstreamHeaders http.Header
 	committed := false
@@ -661,10 +658,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 	modelName := strings.Clone(ojson.GetBytesNoCopy(chatCompletionsJSON, "model").String())
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
+		handlers.SetSSEHeaders(c)
 	}
 	var upstreamHeaders http.Header
 	committed := false
