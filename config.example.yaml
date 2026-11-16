@@ -302,10 +302,14 @@ requests:
   nonstream-keepalive-interval: 0
 
   # Streaming behavior (SSE keep-alives + safe bootstrap retries).
+  # For Cloudflare/Nginx, use keepalive-seconds: 15 and send-keepalive-before-ft: true.
+  # The first heartbeat waits one interval, preserving HTTP errors that arrive sooner.
+  # After a heartbeat is flushed, later failures use SSE errors under HTTP 200.
+  # Disable response buffering in intermediate proxies; see docs/streaming-proxies.md.
   # streaming:
   #   keepalive-seconds: 15         # Default: 0 (disabled). <= 0 disables keep-alives.
   #   bootstrap-retries: 1          # Default: 0 (disabled). Retries before first byte is sent.
-  #   send-keepalive-before-ft: false # Default: false. When true and keepalive-seconds > 0, send SSE heartbeats before the first token.
+  #   send-keepalive-before-ft: false # Default: false. Also covers waiting for upstream response headers. Requires keepalive-seconds > 0.
 
   # Optional payload configuration
   # payload:
