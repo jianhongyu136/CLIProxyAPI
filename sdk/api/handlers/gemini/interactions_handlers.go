@@ -144,10 +144,7 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 		if committed {
 			return
 		}
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
+		handlers.SetSSEHeaders(c)
 		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 		committed = true
 	}

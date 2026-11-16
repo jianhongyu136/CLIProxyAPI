@@ -376,6 +376,8 @@ type StreamingConfig struct {
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
 
 	// SendKeepAliveBeforeFT controls whether SSE heartbeats are sent before the first token arrives
-	// when KeepAliveSeconds > 0. Default is false.
+	// when KeepAliveSeconds > 0, including while the upstream connection is being established.
+	// The first heartbeat waits for one full interval so earlier failures retain their HTTP status.
+	// Once a heartbeat is flushed, subsequent failures are delivered as SSE errors. Default is false.
 	SendKeepAliveBeforeFT bool `yaml:"send-keepalive-before-ft,omitempty" json:"send-keepalive-before-ft,omitempty"`
 }
